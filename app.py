@@ -183,9 +183,12 @@ def extract_entities(answers: list[str], dimension: str,
             m = re.search(r'\{[\s\S]*\}', response)
             if m:
                 data = json.loads(m.group(0))
+                # 对单条回答内去重，避免 LLM 返回重复实体导致计数翻倍
+                seen = set()
                 for name in data.get("entities", []):
                     n = name.strip()
-                    if n:
+                    if n and n not in seen:
+                        seen.add(n)
                         with lock:
                             mention_counts[n] = mention_counts.get(n, 0) + 1
         except Exception:
@@ -224,7 +227,6 @@ def _parse_audit_json(response: str) -> dict:
 
 def _accumulate(audit_result: dict, entities: list[str], acc: dict):
     all_brands = audit_result.get("all_mentioned_brands", [])
-    ranks = {b["brand"]: idx + 1 for idx, b in enumerate(all_brands)}
     total_brands = len(all_brands)
     x_max = max((len((b.get("evidence_text") or "").strip()) for b in all_brands), default=0)
     brand_analysis = audit_result.get("brand_analysis", [])
@@ -242,7 +244,8 @@ def _accumulate(audit_result: dict, entities: list[str], acc: dict):
         if s is not None:
             acc[entity]["sentimentSum"] += s
             acc[entity]["sentimentCount"] += 1
-        rank = ranks.get(entity) or bd.get("physical_rank") or 0
+        # 优先使用 brand_analysis 中的 physical_rank（LLM 直接标注的排名）
+        rank = bd.get("physical_rank") or 0
         if rank > 0 and total_brands > 0:
             acc[entity]["competitivenessSum"] += ((total_brands - rank + 1) / total_brands) * 100
             acc[entity]["rankSum"] += rank
