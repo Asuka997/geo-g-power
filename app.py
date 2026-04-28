@@ -24,13 +24,11 @@ _TIMEOUT      = 300
 _MAX_RETRIES  = 4
 _CONCURRENCY  = 20
 
-GEO_WEIGHTS = {
-    "VISIBILITY":                  0.30,
-    "CREDIBILITY_DEPTH":           0.20,
-    "CREDIBILITY_RECOMMENDATION":  0.20,
-    "COMPETITIVENESS":             0.30,
-    "K_FACTOR_RATIO":              0.20,
-}
+CF_THRESHOLD = 10
+ALPHA_0 = 0.3
+ALPHA_MAX = 0.8
+N_THRESHOLD = 20
+BASELINE_WEIGHTS = {"V": 0.20, "D": 0.20, "R": 0.20, "C": 0.20, "A": 0.20}
 
 ENTITY_CONFIG = {
     "brand":   {"type": "品牌名称",   "examples": "小米、华为、苹果、OPPO、vivo"},
@@ -88,7 +86,8 @@ def _prompt_audit(brand_list, category_def, answer_text):
       "is_mentioned": true或false,
       "evidence_text": "所有相关原文语句（未提及输出空字符串）",
       "physical_rank": <在所有同品类品牌中的排名；未提及输出0>,
-      "sentiment_score": <0-10的浮点数，10=极力推荐，5=中立，0=极度负面；未提及输出null>
+      "sentiment_score": <-1.0到+1.0的浮点数，+1.0=极力推荐，0=中立，-1.0=极度负面；未提及输出null>,
+      "citation_authority_score": <0-100的浮点数，评估回答中提及该品牌时所依据来源的权威性：权威媒体/政府/学术机构→100，行业垂直媒体→70，一般网站/博客→40，无任何来源依据→0；未提及输出null>
     }}
   ]
 }}
@@ -240,59 +239,127 @@ def _accumulate(audit_result: dict, entities: list[str], acc: dict):
         acc[entity]["totalWordCount"] += word_count
         if x_max > 0:
             acc[entity]["depthScoreSum"] += (word_count / x_max) * 100
+        # sentiment: -1.0~+1.0 → 归一化为 0~100
         s = bd.get("sentiment_score")
         if s is not None:
-            acc[entity]["sentimentSum"] += s
+            acc[entity]["sentimentSum"] += (float(s) + 1.0) / 2.0 * 100
             acc[entity]["sentimentCount"] += 1
-        # 优先使用 brand_analysis 中的 physical_rank（LLM 直接标注的排名）
         rank = bd.get("physical_rank") or 0
         if rank > 0 and total_brands > 0:
             acc[entity]["competitivenessSum"] += ((total_brands - rank + 1) / total_brands) * 100
             acc[entity]["rankSum"] += rank
+            if total_brands > 1:
+                acc[entity]["competitiveCount"] += 1
+        # A 维度：引用可信度
+        ca = bd.get("citation_authority_score")
+        if ca is not None:
+            acc[entity]["citationAuthoritySum"] += float(ca)
+            acc[entity]["citationCount"] += 1
 
 
-def _compute_scores(acc: dict, entities: list[str], Q: int, K: int) -> dict:
+def _compute_ewm_weights(raw_scores: dict, m: int) -> dict:
+    """信息熵自适应权重 + 基线混合。raw_scores: {brand: {dim: score_0_100}}"""
+    dims = ["V", "D", "R", "C", "A"]
+    brands = list(raw_scores.keys())
+
+    if m <= 1:
+        return BASELINE_WEIGHTS.copy()
+
+    matrix = [[raw_scores[b][d] for d in dims] for b in brands]
+
+    # 极差归一化
+    norm = []
+    for j, d in enumerate(dims):
+        col = [matrix[i][j] for i in range(m)]
+        mn, mx = min(col), max(col)
+        if mx == mn:
+            norm.append([0.0] * m)
+        else:
+            norm.append([(col[i] - mn) / (mx - mn) for i in range(m)])
+
+    # 贡献比例 p_ij
+    entropy_weights = []
+    for j in range(len(dims)):
+        col_sum = sum(norm[j])
+        if col_sum == 0:
+            p = [1.0 / m] * m
+        else:
+            p = [v / col_sum for v in norm[j]]
+        # 信息熵 e_j
+        ln_m = math.log(m)
+        e = -1.0 / ln_m * sum((pi * math.log(pi) if pi > 0 else 0.0) for pi in p)
+        entropy_weights.append(1.0 - e)  # 差异系数 d_j
+
+    d_sum = sum(entropy_weights)
+    if d_sum == 0:
+        w_entropy = {d: 0.20 for d in dims}
+    else:
+        w_entropy = {dims[j]: entropy_weights[j] / d_sum for j in range(len(dims))}
+
+    # 自适应 α（m >= 2，因为 m <= 1 已 early return）
+    alpha = min(ALPHA_MAX, ALPHA_0 + (ALPHA_MAX - ALPHA_0) * (m - 1) / (N_THRESHOLD - 1))
+
+    # 混合权重
+    mixed = {d: alpha * w_entropy[d] + (1 - alpha) * BASELINE_WEIGHTS[d] for d in dims}
+    total = sum(mixed.values())
+    return {d: mixed[d] / total for d in dims}
+
+
+def _compute_scores(acc: dict, entities: list[str], Q: int) -> tuple[dict, dict]:
+    # 第一步：计算每个品牌的五维原始分
+    raw: dict[str, dict] = {}
+    for entity in entities:
+        d = acc[entity]
+        mc = d["mentionedCount"]
+        v_score = (mc / Q) * 100 if Q > 0 else 0.0
+        d_score = d["depthScoreSum"] / Q if Q > 0 else 0.0
+        r_score = d["sentimentSum"] / d["sentimentCount"] if d["sentimentCount"] > 0 else 0.0
+        c_score = d["competitivenessSum"] / Q if Q > 0 else 0.0
+        a_score = d["citationAuthoritySum"] / d["citationCount"] if d["citationCount"] > 0 else 0.0
+        raw[entity] = {"V": v_score, "D": d_score, "R": r_score, "C": c_score, "A": a_score}
+
+    # 第二步：信息熵自适应权重
+    m = len(entities)
+    weights = _compute_ewm_weights(raw, m)
+
+    # 第三步：计算各维度 CF 并得到最终 G-Power
     result = {}
     for entity in entities:
         d = acc[entity]
-        visibility    = (d["mentionedCount"] / Q) * 100
-        depth         = d["depthScoreSum"] / Q
-        n             = d["sentimentCount"]
-        recommendation = 0.0
-        if n > 0:
-            avg_sent = d["sentimentSum"] / n
-            conf = min(1.0, math.log(n + 1) / math.log(K + 1))
-            recommendation = avg_sent * 10 * conf
-        competitiveness = d["competitivenessSum"] / Q
-        geo = (
-            visibility    * GEO_WEIGHTS["VISIBILITY"] +
-            depth         * GEO_WEIGHTS["CREDIBILITY_DEPTH"] +
-            recommendation * GEO_WEIGHTS["CREDIBILITY_RECOMMENDATION"] +
-            competitiveness * GEO_WEIGHTS["COMPETITIVENESS"]
-        )
-        result[entity] = {
-            "count":                d["mentionedCount"],
-            "avgWords":             round(d["totalWordCount"] / d["mentionedCount"]) if d["mentionedCount"] > 0 else 0,
-            "avgRank":              round(d["rankSum"] / d["mentionedCount"], 1) if d["mentionedCount"] > 0 else None,
-            "visibilityScore":      round(visibility, 1),
-            "depthScore":           round(depth, 1),
-            "recommendationScore":  round(recommendation, 1),
-            "competitivenessScore": round(competitiveness, 1),
-            "geoScore":             round(geo, 1),
+        mc = d["mentionedCount"]
+        cf = {
+            "V": min(1.0, math.sqrt(Q / CF_THRESHOLD)),
+            "D": min(1.0, math.sqrt(mc / CF_THRESHOLD)) if mc > 0 else 0.0,
+            "R": min(1.0, math.sqrt(mc / CF_THRESHOLD)) if mc > 0 else 0.0,
+            "C": min(1.0, math.sqrt(d["competitiveCount"] / CF_THRESHOLD)) if d["competitiveCount"] > 0 else 0.0,
+            "A": min(1.0, math.sqrt(mc / CF_THRESHOLD)) if mc > 0 else 0.0,
         }
-    return result
+        scores = raw[entity]
+        geo = sum(weights[dim] * cf[dim] * scores[dim] for dim in ["V", "D", "R", "C", "A"])
+        result[entity] = {
+            "count":                   mc,
+            "avgWords":                round(d["totalWordCount"] / mc) if mc > 0 else 0,
+            "avgRank":                 round(d["rankSum"] / mc, 1) if mc > 0 else None,
+            "visibilityScore":         round(scores["V"], 1),
+            "depthScore":              round(scores["D"], 1),
+            "recommendationScore":     round(scores["R"], 1),
+            "competitivenessScore":    round(scores["C"], 1),
+            "citationAuthorityScore":  round(scores["A"], 1),
+            "geoScore":                round(min(geo, 100.0), 1),
+        }
+    return result, weights
 
 
 def run_geo_analysis(answers: list[str], entities: list[str],
                      dimension: str, category_def: str,
                      progress_bar=None, status_text=None) -> dict:
     Q = len(answers)
-    K = max(1, round(Q * GEO_WEIGHTS["K_FACTOR_RATIO"]))
     max_tokens = min(128000, max(4000, len(entities) * 400 + 1000))
 
     acc = {e: {"mentionedCount": 0, "depthScoreSum": 0.0, "sentimentSum": 0.0,
                "sentimentCount": 0, "competitivenessSum": 0.0, "rankSum": 0,
-               "totalWordCount": 0} for e in entities}
+               "totalWordCount": 0, "citationAuthoritySum": 0.0,
+               "citationCount": 0, "competitiveCount": 0} for e in entities}
     lock = Lock()
     failed = []
 
@@ -323,8 +390,8 @@ def run_geo_analysis(answers: list[str], entities: list[str],
             if status_text:
                 status_text.text(f"分析中… {i} / {Q} 条，失败 {len(failed)} 条")
 
-    scores = _compute_scores(acc, entities, Q, K)
-    return scores, failed
+    scores, weights = _compute_scores(acc, entities, Q)
+    return scores, failed, weights
 
 
 # ─── 结果转 DataFrame ──────────────────────────────────────────────────────────
@@ -335,10 +402,11 @@ def scores_to_df(scores: dict, total_q: int) -> pd.DataFrame:
             "品牌/产品":     name,
             "提及次数":     d["count"],
             "提及率(%)":   round(d["count"] / total_q * 100, 1) if total_q else 0,
-            "可见度":       d["visibilityScore"],
-            "提及深度":     d["depthScore"],
-            "推荐程度":     d["recommendationScore"],
-            "竞争力":       d["competitivenessScore"],
+            "可见度(V)":    d["visibilityScore"],
+            "提及深度(D)":  d["depthScore"],
+            "推荐倾向(R)":  d["recommendationScore"],
+            "竞争力(C)":    d["competitivenessScore"],
+            "引用可信度(A)": d["citationAuthorityScore"],
             "平均排名":     d["avgRank"] if d["avgRank"] is not None else "-",
             "GEO得分":      d["geoScore"],
         })
@@ -371,6 +439,7 @@ for key, default in [
     ("scores", {}),
     ("failed_items", []),
     ("total_q", 0),
+    ("ewm_weights", {}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -566,14 +635,15 @@ elif st.session_state.step == 4:
         status_text  = st.empty()
 
         with st.spinner("GEO 分析中，请稍候…"):
-            scores, failed = run_geo_analysis(
+            scores, failed, weights = run_geo_analysis(
                 answers, entities, dim, cat_def,
                 progress_bar=progress_bar,
                 status_text=status_text,
             )
 
-        st.session_state.scores      = scores
+        st.session_state.scores       = scores
         st.session_state.failed_items = failed
+        st.session_state.ewm_weights  = weights
         progress_bar.empty()
         status_text.empty()
 
@@ -615,6 +685,17 @@ elif st.session_state.step == 5:
         # 结果表
         st.dataframe(df, width='stretch', height=400)
 
+        # EWM 权重快照
+        if st.session_state.ewm_weights:
+            with st.expander("本批次 G-Power V2 权重快照（信息熵自适应）"):
+                w = st.session_state.ewm_weights
+                wc1, wc2, wc3, wc4, wc5 = st.columns(5)
+                wc1.metric("可见度 V", f"{w.get('V', 0):.1%}")
+                wc2.metric("提及深度 D", f"{w.get('D', 0):.1%}")
+                wc3.metric("推荐倾向 R", f"{w.get('R', 0):.1%}")
+                wc4.metric("竞争力 C", f"{w.get('C', 0):.1%}")
+                wc5.metric("引用可信度 A", f"{w.get('A', 0):.1%}")
+
         # 下载
         base_name = st.session_state.source_file_name
         if base_name:
@@ -653,6 +734,6 @@ elif st.session_state.step == 5:
             if st.button("🆕 重置，从头开始"):
                 for key in ["step", "dimension", "qa_data", "source_file_name",
                             "extracted_entities", "selected_brands", "category_def",
-                            "scores", "failed_items", "total_q"]:
+                            "scores", "failed_items", "total_q", "ewm_weights"]:
                     del st.session_state[key]
                 st.rerun()
