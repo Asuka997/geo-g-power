@@ -704,9 +704,28 @@ elif st.session_state.step == 5:
             base_name = f"{dim_text}提及分析"
         date_str = datetime.now().strftime("%Y-%m-%d")
 
+        # 权重快照 DataFrame（附在导出数据末尾）
+        w = st.session_state.ewm_weights
+        weight_df = pd.DataFrame([{
+            "维度": "可见度(V)", "权重": f"{w.get('V', 0):.4f}",
+        }, {
+            "维度": "提及深度(D)", "权重": f"{w.get('D', 0):.4f}",
+        }, {
+            "维度": "推荐倾向(R)", "权重": f"{w.get('R', 0):.4f}",
+        }, {
+            "维度": "竞争力(C)", "权重": f"{w.get('C', 0):.4f}",
+        }, {
+            "维度": "引用可信度(A)", "权重": f"{w.get('A', 0):.4f}",
+        }]) if w else pd.DataFrame()
+
         col_dl1, col_dl2, col_dl3 = st.columns([1, 1, 5])
         with col_dl1:
-            csv_bytes = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            # CSV：品牌结果 + 空行 + 权重快照
+            csv_parts = [df.to_csv(index=False, encoding="utf-8-sig")]
+            if not weight_df.empty:
+                csv_parts += ["\n本批次G-Power V2权重快照\n",
+                              weight_df.to_csv(index=False, encoding="utf-8-sig")]
+            csv_bytes = "".join(csv_parts).encode("utf-8-sig")
             st.download_button(
                 "⬇ 导出 CSV",
                 data=csv_bytes,
@@ -717,6 +736,8 @@ elif st.session_state.step == 5:
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as writer:
                 df.to_excel(writer, index=False, sheet_name="GEO分析")
+                if not weight_df.empty:
+                    weight_df.to_excel(writer, index=False, sheet_name="权重快照")
             st.download_button(
                 "⬇ 导出 Excel",
                 data=buf.getvalue(),
