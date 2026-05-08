@@ -41,8 +41,9 @@ DEFAULT_CATEGORY = {
 }
 
 # ─── Prompts ──────────────────────────────────────────────────────────────────
-def _prompt_extract(entity_type, examples, text):
-    return f"""请从以下文本中提取所有提及的{entity_type}。
+def _prompt_extract(entity_type, examples, text, extract_scope: str = ""):
+    scope_line = f"\n提取范围限定：{extract_scope}（仅提取符合该描述的{entity_type}，不符合的一律忽略）" if extract_scope else ""
+    return f"""请从以下文本中提取所有提及的{entity_type}。{scope_line}
 
 要求：
 1. 只提取{entity_type}，不要提取其他内容
@@ -169,6 +170,7 @@ def parse_uploaded_file(uploaded_file) -> list[dict]:
 
 # ─── 实体提取 ─────────────────────────────────────────────────────────────────
 def extract_entities(answers: list[str], dimension: str,
+                     extract_scope: str = "",
                      progress_bar=None, status_text=None) -> list[tuple[str, int]]:
     cfg = ENTITY_CONFIG[dimension]
     mention_counts: dict[str, int] = {}
@@ -176,7 +178,7 @@ def extract_entities(answers: list[str], dimension: str,
     total = len(answers)
 
     def process_one(answer: str):
-        prompt = _prompt_extract(cfg["type"], cfg["examples"], answer)
+        prompt = _prompt_extract(cfg["type"], cfg["examples"], answer, extract_scope)
         try:
             response = _call_api(prompt, max_tokens=500)
             m = re.search(r'\{[\s\S]*\}', response)
@@ -440,6 +442,7 @@ for key, default in [
     ("failed_items", []),
     ("total_q", 0),
     ("ewm_weights", {}),
+    ("extract_scope", ""),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -518,6 +521,13 @@ elif st.session_state.step == 3:
     )
     st.session_state.category_def = category_def
 
+    extract_scope = st.text_input(
+        "提取类别说明（选填）",
+        value=st.session_state.get("extract_scope", ""),
+        placeholder="精确限定提取范围，例：只提取 AI Agent 编排框架，排除通信协议（MCP/A2A）、云平台和底层模型",
+    )
+    st.session_state.extract_scope = extract_scope
+
     # ── 提取按钮 ────────────────────────────────────────────────────────────
     if st.button("🔍 从回答中自动提取", type="primary",
                  disabled=len(st.session_state.extracted_entities) > 0):
@@ -526,6 +536,7 @@ elif st.session_state.step == 3:
         with st.spinner("正在分析回答，提取品牌…"):
             result = extract_entities(
                 answers, st.session_state.dimension,
+                extract_scope=st.session_state.extract_scope,
                 progress_bar=progress_bar, status_text=status_text,
             )
         st.session_state.extracted_entities = result
@@ -755,6 +766,7 @@ elif st.session_state.step == 5:
             if st.button("🆕 重置，从头开始"):
                 for key in ["step", "dimension", "qa_data", "source_file_name",
                             "extracted_entities", "selected_brands", "category_def",
-                            "scores", "failed_items", "total_q", "ewm_weights"]:
+                            "scores", "failed_items", "total_q", "ewm_weights",
+                            "extract_scope"]:
                     del st.session_state[key]
                 st.rerun()
