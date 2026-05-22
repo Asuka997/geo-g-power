@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: geo-g-power
+  labels:
+    app: geo-g-power
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: geo-g-power
+  template:
+    metadata:
+      labels:
+        app: geo-g-power
+    spec:
+      imagePullSecrets:
+        - name: ghcr-secret
+      containers:
+        - name: geo-g-power
+          image: IMAGE_PLACEHOLDER
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8501
+          env:
+            - name: ARK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: geo-g-power-secret
+                  key: ark-api-key
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: geo-g-power
+spec:
+  selector:
+    app: geo-g-power
+  ports:
+    - port: 8501
+      targetPort: 8501
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: geo-g-power
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+spec:
+  rules:
+    - host: geo-g-power.NAMESPACE.sealos.run
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: geo-g-power
+                port:
+                  number: 8501
