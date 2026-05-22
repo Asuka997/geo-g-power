@@ -65,7 +65,7 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-body-size: "50m"
 spec:
   rules:
-    - host: geo-g-power.NAMESPACE.sealos.run
+    - host: geo-g-power.ns-owl0bwe1.cloud.sealos.io
       http:
         paths:
           - path: /
