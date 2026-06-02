@@ -586,11 +586,10 @@ elif st.session_state.step == 3:
 
         for i, (name, count) in enumerate(extracted):
             col = left_col if i < half else right_col
-            checked = col.checkbox(
-                f"{name}　`{count} 条`",
-                value=(name in selected_set),
-                key=f"cb_{name}",
-            )
+            # 仅在首次渲染时初始化，避免与 session_state 冲突
+            if f"cb_{name}" not in st.session_state:
+                st.session_state[f"cb_{name}"] = (name in selected_set)
+            checked = col.checkbox(f"{name}　`{count} 条`", key=f"cb_{name}")
             if checked:
                 new_selected.append(name)
 
