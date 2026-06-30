@@ -17,9 +17,9 @@ from datetime import datetime
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
 import os
-_API_KEY      = os.environ.get("ARK_API_KEY", "")
-_ENDPOINT_ID  = os.environ.get("ARK_ENDPOINT_ID", "doubao-seed-2-0-mini-260215")
-_BASE_URL     = os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
+_API_KEY      = os.environ.get("OPENROUTER_API_KEY", "")
+_ENDPOINT_ID  = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+_BASE_URL     = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
 _TIMEOUT      = 300
 _MAX_RETRIES  = 4
 _CONCURRENCY  = 10
