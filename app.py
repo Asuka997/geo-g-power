@@ -175,18 +175,20 @@ def parse_uploaded_file(uploaded_file) -> list[dict]:
 
 
 def parse_clipboard_text(text: str) -> list[dict]:
-    rows = []
-    lines = [l for l in text.splitlines() if l.strip()]
-    if not lines:
-        return rows
-    first_cols = [c.strip() for c in lines[0].split("\t")]
+    import csv
+    # csv.reader 能正确处理 Excel 复制时带引号的多行单元格（\t 分隔）
+    reader = csv.reader(io.StringIO(text), delimiter="\t")
+    all_rows = [r for r in reader if any(c.strip() for c in r)]
+    if not all_rows:
+        return []
+    first_cols = [c.strip() for c in all_rows[0]]
     is_header = any(h in first_cols for h in
                     ["问题", "question", "Question", "回答", "answer", "Answer"])
-    for line in lines[1 if is_header else 0:]:
-        cols = line.split("\t")
-        if len(cols) < 2:
+    rows = []
+    for row in all_rows[1 if is_header else 0:]:
+        if len(row) < 2:
             continue
-        q, a = cols[0].strip(), cols[1].strip()
+        q, a = row[0].strip(), row[1].strip()
         if q and a and q != "nan" and a != "nan":
             rows.append({"question": q, "answer": a})
     return rows
@@ -548,8 +550,11 @@ elif st.session_state.step == 2:
 
         if "_paste_preview" in st.session_state:
             pv = st.session_state._paste_preview
-            st.success(f"解析成功，共 **{len(pv)}** 条问答数据")
-            st.dataframe(pd.DataFrame(pv[:5]), use_container_width=True)
+            avg_len = int(sum(len(r["answer"]) for r in pv) / len(pv)) if pv else 0
+            st.success(f"解析成功，共 **{len(pv)}** 条问答数据，回答平均 **{avg_len}** 字")
+            preview_df = pd.DataFrame(pv[:5]).copy()
+            preview_df["answer"] = preview_df["answer"].str[:80] + "…"
+            st.dataframe(preview_df, use_container_width=True)
             col1, col2 = st.columns([1, 5])
             with col1:
                 if st.button("下一步", type="primary", key="btn_paste_next"):
