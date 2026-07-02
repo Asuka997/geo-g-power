@@ -59,8 +59,13 @@ def _prompt_extract(entity_type, examples, text, extract_scope: str = ""):
 请只返回JSON，不要任何解释。"""
 
 
-def _prompt_audit(brand_list, category_def, answer_text):
-    brands_str = "\n".join(f"- {b}" for b in brand_list)
+def _prompt_audit(brand_list, category_def, answer_text, brand_aliases=None):
+    def _fmt(b):
+        aliases = (brand_aliases or {}).get(b, [])
+        if aliases:
+            return f"- {b}（别名/子品牌：{', '.join(aliases)}）"
+        return f"- {b}"
+    brands_str = "\n".join(_fmt(b) for b in brand_list)
     return f"""你是一位专业的品牌分析审计员。请严格分析以下回答文本，一次性完成全量品牌扫描与监测品牌详细分析。
 
 **品类定义：** {category_def}（仅计入与目标品类构成直接购买替代关系的品牌；操作系统、芯片品牌、电商平台等上下游实体不计入）
@@ -98,6 +103,7 @@ def _prompt_audit(brand_list, category_def, answer_text):
 - 所有条目的physical_rank必须连续且唯一（1到total_brands_mentioned），不得重复或缺失
 - brand_analysis中有提及品牌的physical_rank必须与all_mentioned_brands中对应条目一致
 - 别名/简称/旗下产品均算提及母品牌（如iPhone→Apple，华子→华为）
+- 品牌名称后括号内列出的别名/子品牌，其提及均归入对应主品牌统计，不单独列项
 - 以对比方式出现的品牌也算提及
 - 禁止AI直接统计字数，evidence_text只摘录原文
 
@@ -163,6 +169,24 @@ def parse_uploaded_file(uploaded_file) -> list[dict]:
             continue
         q = str(row.iloc[0]).strip()
         a = str(row.iloc[1]).strip()
+        if q and a and q != "nan" and a != "nan":
+            rows.append({"question": q, "answer": a})
+    return rows
+
+
+def parse_clipboard_text(text: str) -> list[dict]:
+    rows = []
+    lines = [l for l in text.splitlines() if l.strip()]
+    if not lines:
+        return rows
+    first_cols = [c.strip() for c in lines[0].split("\t")]
+    is_header = any(h in first_cols for h in
+                    ["问题", "question", "Question", "回答", "answer", "Answer"])
+    for line in lines[1 if is_header else 0:]:
+        cols = line.split("\t")
+        if len(cols) < 2:
+            continue
+        q, a = cols[0].strip(), cols[1].strip()
         if q and a and q != "nan" and a != "nan":
             rows.append({"question": q, "answer": a})
     return rows
@@ -354,6 +378,7 @@ def _compute_scores(acc: dict, entities: list[str], Q: int) -> tuple[dict, dict]
 
 def run_geo_analysis(answers: list[str], entities: list[str],
                      dimension: str, category_def: str,
+                     brand_aliases: dict | None = None,
                      progress_bar=None, status_text=None) -> dict:
     Q = len(answers)
     max_tokens = min(128000, max(4000, len(entities) * 400 + 1000))
@@ -368,7 +393,7 @@ def run_geo_analysis(answers: list[str], entities: list[str],
     def process_one(idx: int, answer: str):
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                prompt = _prompt_audit(entities, category_def, answer)
+                prompt = _prompt_audit(entities, category_def, answer, brand_aliases=brand_aliases)
                 resp = _call_api(prompt, max_tokens=max_tokens)
                 result = _parse_audit_json(resp)
                 with lock:
@@ -443,6 +468,7 @@ for key, default in [
     ("total_q", 0),
     ("ewm_weights", {}),
     ("extract_scope", ""),
+    ("brand_aliases", {}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -479,25 +505,52 @@ elif st.session_state.step == 2:
     st.subheader("第 2 步：上传问答数据")
     st.info("文件格式：CSV 或 Excel，**第1列 = 问题，第2列 = 回答**（有无表头均可）")
 
-    uploaded = st.file_uploader("选择文件", type=["csv", "xlsx", "xls"])
+    tab_upload, tab_paste = st.tabs(["📁 上传文件", "📋 粘贴表格"])
 
-    if uploaded:
-        try:
-            qa_data = parse_uploaded_file(uploaded)
-            st.success(f"解析成功，共 **{len(qa_data)}** 条问答数据")
-            preview = pd.DataFrame(qa_data[:5])
-            st.dataframe(preview, width='stretch')
+    with tab_upload:
+        uploaded = st.file_uploader("选择文件", type=["csv", "xlsx", "xls"])
+        if uploaded:
+            try:
+                qa_data = parse_uploaded_file(uploaded)
+                st.success(f"解析成功，共 **{len(qa_data)}** 条问答数据")
+                preview = pd.DataFrame(qa_data[:5])
+                st.dataframe(preview, width='stretch')
 
-            col1, col2 = st.columns([1, 5])
-            with col1:
-                if st.button("下一步", type="primary"):
-                    st.session_state.qa_data = qa_data
-                    st.session_state.source_file_name = uploaded.name
-                    st.session_state.total_q = len(qa_data)
-                    st.session_state.step = 3
-                    st.rerun()
-        except Exception as e:
-            st.error(f"文件解析失败：{e}")
+                col1, col2 = st.columns([1, 5])
+                with col1:
+                    if st.button("下一步", type="primary"):
+                        st.session_state.qa_data = qa_data
+                        st.session_state.source_file_name = uploaded.name
+                        st.session_state.total_q = len(qa_data)
+                        st.session_state.step = 3
+                        for k in ("extracted_entities", "selected_brands",
+                                  "category_def", "extract_scope", "brand_aliases"):
+                            st.session_state.pop(k, None)
+                        st.rerun()
+            except Exception as e:
+                st.error(f"文件解析失败：{e}")
+
+    with tab_paste:
+        st.caption("从 Excel / Google Sheets 复制数据区域后直接粘贴，第1列=问题，第2列=回答")
+        paste_text = st.text_area(
+            "粘贴内容",
+            height=220,
+            placeholder="在 Excel 中选中数据区域 → Ctrl+C → 点这里 → Ctrl+V",
+            label_visibility="collapsed",
+        )
+        if st.button("解析", key="btn_parse_paste") and paste_text.strip():
+            qa_data = parse_clipboard_text(paste_text)
+            if qa_data:
+                st.session_state.qa_data = qa_data
+                st.session_state.source_file_name = "粘贴数据"
+                st.session_state.total_q = len(qa_data)
+                st.session_state.step = 3
+                for k in ("extracted_entities", "selected_brands",
+                          "category_def", "extract_scope", "brand_aliases"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+            else:
+                st.error("未解析到有效数据，请确认格式：第1列=问题，第2列=回答，Tab 分隔")
 
     if st.button("← 返回"):
         st.session_state.step = 1
@@ -608,6 +661,20 @@ elif st.session_state.step == 3:
                     st.session_state.selected_brands = [name] + st.session_state.selected_brands
                 st.rerun()
 
+        # ── 别名配置 ──────────────────────────────────────────────────────────
+        with st.expander("⚙️ 配置品牌别名 / 子品牌（可选）"):
+            st.caption("填写别名后，分析时别名提及将自动归入主品牌统计。多个别名用逗号分隔。")
+            for name, _ in extracted:
+                raw = st.text_input(
+                    f"{name}  →  别名 / 子品牌",
+                    value=", ".join(st.session_state.brand_aliases.get(name, [])),
+                    key=f"alias_{name}",
+                    placeholder="如：红米, Redmi（留空则不配置）",
+                )
+                st.session_state.brand_aliases[name] = [
+                    a.strip() for a in raw.split(",") if a.strip()
+                ]
+
         st.divider()
         st.markdown(f"已选 **{len(new_selected)}** 个{dim_text}")
 
@@ -647,6 +714,7 @@ elif st.session_state.step == 4:
         with st.spinner("GEO 分析中，请稍候…"):
             scores, failed, weights = run_geo_analysis(
                 answers, entities, dim, cat_def,
+                brand_aliases=st.session_state.get("brand_aliases", {}),
                 progress_bar=progress_bar,
                 status_text=status_text,
             )
