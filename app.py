@@ -541,16 +541,27 @@ elif st.session_state.step == 2:
         if st.button("解析", key="btn_parse_paste") and paste_text.strip():
             qa_data = parse_clipboard_text(paste_text)
             if qa_data:
-                st.session_state.qa_data = qa_data
-                st.session_state.source_file_name = "粘贴数据"
-                st.session_state.total_q = len(qa_data)
-                st.session_state.step = 3
-                for k in ("extracted_entities", "selected_brands",
-                          "category_def", "extract_scope", "brand_aliases"):
-                    st.session_state.pop(k, None)
-                st.rerun()
+                st.session_state._paste_preview = qa_data
             else:
+                st.session_state.pop("_paste_preview", None)
                 st.error("未解析到有效数据，请确认格式：第1列=问题，第2列=回答，Tab 分隔")
+
+        if "_paste_preview" in st.session_state:
+            pv = st.session_state._paste_preview
+            st.success(f"解析成功，共 **{len(pv)}** 条问答数据")
+            st.dataframe(pd.DataFrame(pv[:5]), use_container_width=True)
+            col1, col2 = st.columns([1, 5])
+            with col1:
+                if st.button("下一步", type="primary", key="btn_paste_next"):
+                    st.session_state.qa_data = pv
+                    st.session_state.source_file_name = "粘贴数据"
+                    st.session_state.total_q = len(pv)
+                    st.session_state.step = 3
+                    for k in ("extracted_entities", "selected_brands",
+                              "category_def", "extract_scope", "brand_aliases",
+                              "_paste_preview"):
+                        st.session_state.pop(k, None)
+                    st.rerun()
 
     if st.button("← 返回"):
         st.session_state.step = 1
