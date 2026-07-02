@@ -680,7 +680,7 @@ elif st.session_state.step == 3:
         # ── 别名配置 ──────────────────────────────────────────────────────────
         with st.expander("⚙️ 配置品牌别名 / 子品牌（可选）"):
             st.caption("填写别名后，分析时别名提及将自动归入主品牌统计。多个别名用逗号分隔。")
-            for name, _ in extracted:
+            for name in new_selected:
                 raw = st.text_input(
                     f"{name}  →  别名 / 子品牌",
                     value=", ".join(st.session_state.brand_aliases.get(name, [])),
@@ -690,6 +690,7 @@ elif st.session_state.step == 3:
                 st.session_state.brand_aliases[name] = [
                     a.strip() for a in raw.split(",") if a.strip()
                 ]
+
 
         st.divider()
         st.markdown(f"已选 **{len(new_selected)}** 个{dim_text}")
